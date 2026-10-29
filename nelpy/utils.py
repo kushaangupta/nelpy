@@ -14,6 +14,8 @@ __all__ = [
     "get_events_boundaries",
     "get_threshold_crossing_epochs",
     "_bst_get_bins",
+    "kernel_rate",
+    "kernel_bandwidth",
 ]
 
 import copy
@@ -22,11 +24,13 @@ from collections import namedtuple
 from itertools import tee
 from math import floor
 
+import numba
 import numpy as np
 from numpy import ceil, log
 from scipy.ndimage import gaussian_filter as scipy_gaussian_filter
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import hilbert
+from scipy.special import erf, ndtr
 
 from . import core  # so that core.RegularlySampledAnalogSignalArray is exposed
 from .utils_.decorators import keyword_deprecation
@@ -1238,7 +1242,7 @@ def get_contiguous_segments(
         bdries = []
 
         if not index:
-            for k, g in groupby(enumerate(data), lambda ix: (ix[0] - ix[1])):
+            for k, g in groupby(enumerate(data), lambda ix: ix[0] - ix[1]):
                 f = itemgetter(1)
                 gen = (f(x) for x in g)
                 start = next(gen)
@@ -1248,7 +1252,7 @@ def get_contiguous_segments(
                 bdries.append([start, stop + step])
         else:
             counter = 0
-            for k, g in groupby(enumerate(data), lambda ix: (ix[0] - ix[1])):
+            for k, g in groupby(enumerate(data), lambda ix: ix[0] - ix[1]):
                 f = itemgetter(1)
                 gen = (f(x) for x in g)
                 _ = next(gen)
@@ -1978,6 +1982,233 @@ def nextfastpower(n):
     # Lump the powers of 3 and 5 together and solve for the powers of 2.
     n2 = nextpower(n / n35)
     return int(min(n2 * n35))
+
+
+@numba.njit(cache=True, parallel=True)
+def _gaussian_kernel_sums(spikes, offsets, centers, sigmas, truncate):
+    n_units = offsets.size - 1
+    out = np.zeros((n_units, centers.size))
+    for unit in numba.prange(n_units):
+        sigma = sigmas[unit]
+        reach = truncate * sigma
+        for spike in spikes[offsets[unit] : offsets[unit + 1]]:
+            lo = np.searchsorted(centers, spike - reach, side="left")
+            hi = np.searchsorted(centers, spike + reach, side="right")
+            for k in range(lo, hi):
+                z = (centers[k] - spike) / sigma
+                out[unit, k] += np.exp(-0.5 * z * z)
+    return out
+
+
+def _spikes_by_interval(st, intervals):
+    """Sorted spike times of each unit, split by support interval [start, stop)."""
+    units = [np.sort(np.asarray(times, dtype=float)) for times in st.data]
+    by_interval = []
+    for start, stop in intervals:
+        by_interval.append(
+            [
+                times[np.searchsorted(times, start) : np.searchsorted(times, stop)]
+                for times in units
+            ]
+        )
+    return by_interval
+
+
+def kernel_rate(st, *, ds, sigma, truncate=4, edge_correction=True):
+    """Estimate firing rates by placing a Gaussian kernel on every spike time.
+
+    Each spike contributes a Gaussian density centered on its exact time, so the
+    estimate is non-negative without first rounding spikes into bins. Rates are evaluated at the bin centers of
+    ``st.bin(ds=ds)`` and only spikes from the same support interval contribute
+    to an estimate.
+
+    Parameters
+    ----------
+    st : SpikeTrainArray
+        Spike times. Any :class:`EventArray` is accepted.
+    ds : float
+        Spacing of the output samples, in the units of the spike times.
+    sigma : float or array-like
+        Standard deviation of the Gaussian kernel, in the units of the spike
+        times. Either one value for all units or one value per unit, e.g. the
+        output of :func:`kernel_bandwidth`.
+    truncate : float, optional
+        Truncate the kernel at this many standard deviations. The truncated
+        kernel is renormalized to unit area. Default is 4.
+    edge_correction : bool, optional
+        If True (default), normalize at each evaluation point by the kernel
+        mass inside its support interval. This corrects boundary bias for a
+        locally constant rate; it does not guarantee preservation of spike count. If False, kernel mass outside the
+        support is discarded.
+
+    Returns
+    -------
+    AnalogSignalArray
+        One signal per unit, in spikes per unit time (Hz for spike times in
+        seconds), sampled every ``ds`` with the support of ``st.bin(ds=ds)``.
+
+    Notes
+    -----
+    Unlike local polynomial regression smoothers, a kernel rate estimate
+    cannot become negative.
+
+    Examples
+    --------
+    >>> st = nel.SpikeTrainArray([0.1, 0.12, 0.5, 0.9], support=nel.EpochArray([0, 1]))
+    >>> rate = nel.utils.kernel_rate(st, ds=0.01, sigma=0.05)
+
+    """
+    if not isinstance(st, core.EventArray):
+        raise NotImplementedError(f"kernel_rate for {type(st)} is not yet supported!")
+    if st.isempty:
+        raise ValueError("kernel_rate requires a non-empty spike train")
+
+    try:
+        ds = float(ds)
+        truncate = float(truncate)
+        sigmas = np.broadcast_to(np.asarray(sigma, dtype=float), (st.n_series,)).copy()
+    except (TypeError, ValueError):
+        raise ValueError(
+            "ds and truncate must be scalars, and sigma a scalar or one value per unit"
+        )
+    for name, values in [("ds", ds), ("sigma", sigmas), ("truncate", truncate)]:
+        if not np.all(np.isfinite(values)) or np.any(np.asarray(values) <= 0):
+            raise ValueError(f"{name} must be positive and finite")
+
+    if np.all(np.diff(st.support.data, axis=1) < ds):
+        raise ValueError("ds is longer than every support interval")
+    bst = st.bin(ds=ds)
+    centers = bst.bin_centers
+    rates = np.empty((st.n_series, centers.size))
+    kernel_mass = erf(truncate / np.sqrt(2))
+    widths = sigmas[:, np.newaxis]
+    stops = np.cumsum(bst.lengths)
+    intervals = bst.support.data
+    for (start, stop), spikes, last, n_bins in zip(
+        intervals, _spikes_by_interval(st, intervals), stops, bst.lengths
+    ):
+        grid = centers[last - n_bins : last]
+        offsets = np.r_[0, np.cumsum([times.size for times in spikes])]
+        sums = _gaussian_kernel_sums(
+            np.concatenate(spikes), offsets, grid, sigmas, truncate
+        )
+        rate = sums / (np.sqrt(2 * np.pi) * widths * kernel_mass)
+        if edge_correction:
+            upper = np.minimum((stop - grid) / widths, truncate)
+            lower = np.maximum((start - grid) / widths, -truncate)
+            rate *= kernel_mass / (ndtr(upper) - ndtr(lower))
+        rates[:, last - n_bins : last] = rate
+
+    return core.AnalogSignalArray(
+        rates,
+        abscissa_vals=centers,
+        fs=1 / ds,
+        support=bst.support,
+        labels=st.unit_labels if hasattr(st, "unit_labels") else None,
+    )
+
+
+def _bandwidth_cost(spikes_by_interval, intervals, candidates, bin_width):
+    """Shimazaki-Shinomoto cost for each candidate bandwidth, up to a constant.
+
+    The pairwise kernel sums are evaluated from the power spectrum of a fine
+    spike histogram, so the cost of every candidate needs only one FFT.
+    """
+    n_spikes = sum(spikes.size for spikes in spikes_by_interval)
+    cost = 2 * n_spikes / (np.sqrt(2 * np.pi) * candidates)
+    for spikes, (start, stop) in zip(spikes_by_interval, intervals):
+        if spikes.size == 0:
+            continue
+        n_bins = max(1, int(np.ceil((stop - start) / bin_width)))
+        bins = np.minimum(((spikes - start) / bin_width).astype(int), n_bins - 1)
+        counts = np.bincount(bins, minlength=n_bins).astype(float)
+        # Zero-padding past the widest kernel keeps the autocorrelation linear.
+        reach = int(np.ceil(5 * np.sqrt(2) * candidates.max() / bin_width))
+        n_fft = next_fast_len(n_bins + reach)
+        power = np.abs(np.fft.rfft(counts, n_fft)) ** 2
+        power[1:] *= 2  # one-sided spectrum
+        if n_fft % 2 == 0:
+            power[-1] /= 2
+        frequencies = np.arange(power.size) / (n_fft * bin_width)
+        for index, width in enumerate(candidates):
+            n_keep = np.searchsorted(frequencies, 1.3 / width)
+            gain = np.exp(-2 * (np.pi * width * frequencies[:n_keep]) ** 2)
+            cost[index] += (
+                power[:n_keep] @ (gain * gain - 2 * gain) / (n_fft * bin_width)
+            )
+    return cost
+
+
+def kernel_bandwidth(st, *, candidates=None):
+    """Choose a Gaussian kernel bandwidth for each unit from its spike times.
+
+    For each unit, the bandwidth is the candidate that minimizes Shimazaki and
+    Shinomoto's (2010) estimate of the integrated squared error between the
+    kernel rate estimate and the unknown underlying rate, assuming spikes from
+    a Poisson process. Only the spike times are used, so the bandwidth is chosen
+    without a hand-tuned smoothing parameter. Pairs of spikes from different
+    support intervals are ignored.
+
+    Parameters
+    ----------
+    st : SpikeTrainArray
+        Spike times. Any :class:`EventArray` is accepted.
+    candidates : array-like, optional
+        Bandwidths to compare, in the units of the spike times. By default, 100
+        log-spaced values from a tenth of the unit's mean inter-spike interval
+        to a quarter of the longest support interval.
+
+    Returns
+    -------
+    np.ndarray
+        One bandwidth per unit, suitable as ``sigma`` for :func:`kernel_rate`.
+        NaN for units with fewer than two spikes.
+
+    Notes
+    -----
+    The cost is approximated from a histogram with bins one fifth of the
+    smallest candidate bandwidth.
+
+    References
+    ----------
+    Shimazaki, H. & Shinomoto, S. (2010). Kernel bandwidth optimization in spike
+    rate estimation. Journal of Computational Neuroscience, 29, 171-182.
+
+    Examples
+    --------
+    >>> sigma = nel.utils.kernel_bandwidth(st)
+    >>> rate = nel.utils.kernel_rate(st, ds=0.01, sigma=sigma)
+
+    """
+    if not isinstance(st, core.EventArray):
+        raise NotImplementedError(
+            f"kernel_bandwidth for {type(st)} is not yet supported!"
+        )
+    if st.isempty:
+        raise ValueError("kernel_bandwidth requires a non-empty spike train")
+    if candidates is not None:
+        candidates = np.sort(np.asarray(candidates, dtype=float).ravel())
+        if candidates.size == 0 or not np.all(np.isfinite(candidates)):
+            raise ValueError("candidates must be a non-empty array of finite values")
+        if candidates[0] <= 0:
+            raise ValueError("candidates must be positive")
+
+    intervals = st.support.data
+    spikes_by_interval = _spikes_by_interval(st, intervals)
+    bandwidths = np.full(st.n_series, np.nan)
+    for unit in range(st.n_series):
+        unit_spikes = [spikes[unit] for spikes in spikes_by_interval]
+        n_spikes = sum(spikes.size for spikes in unit_spikes)
+        if n_spikes < 2:
+            continue
+        widths = candidates
+        if widths is None:
+            mean_isi = st.support.duration / n_spikes
+            longest = np.max(intervals[:, 1] - intervals[:, 0])
+            widths = np.geomspace(mean_isi / 10, max(longest / 4, mean_isi), 100)
+        cost = _bandwidth_cost(unit_spikes, intervals, widths, widths[0] / 5)
+        bandwidths[unit] = widths[np.argmin(cost)]
+    return bandwidths
 
 
 @keyword_deprecation(replace_x_with_y={"bw": "truncate"})
