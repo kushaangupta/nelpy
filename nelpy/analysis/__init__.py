@@ -23,6 +23,7 @@ from .replay import (
     trajectory_score_array,
     trajectory_score_bst,
 )
+from .spikes import PSTHResult, psth
 
 __all__ = [
     "linregress_ting",
@@ -39,6 +40,8 @@ __all__ = [
     "pooled_time_swap_bst",
     "steady_state",
     "fmpt",
+    "psth",
+    "PSTHResult",
 ]
 
 __version__ = "0.0.1"  # should I maintain a separate version for this?
